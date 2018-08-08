@@ -8,14 +8,22 @@ from contextlib import contextmanager
 from collections import namedtuple
 
 #
+# Example:
+#   # Get 160 messages from matched topics, write them into an AVRO file
+#      ./kcp --progress "kafka://epyc.astro.washington.edu/^ztf_20180808_programid.$" mydata.avro --count 160
+#   # Get 160 messages from matched topics, write them out as JSON
+#      ./kcp --progress "kafka://epyc.astro.washington.edu/^ztf_20180808_programid.$" mydata.json --count 160
+#
+
+#
 # Goals:
 #
-# st --progress --from-avro --to-json "kafka://epyc.astro.washington.edu:9092/^ztf_2018072*_programid.$" "kafka://localhost/ztf_json"
-# st --progress --from-avro --to-json avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
-# st --progress --from-avro --to-avro avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
-# st --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json "kafka://localhost/ztf_avro"
-# st --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json foo.avro
-# st --progress --from-json --to-json file1.json file2.json file2.json foo.json  # should output a JSON record-set, one record per line
+# kcp --progress --from-avro --to-json "kafka://epyc.astro.washington.edu:9092/^ztf_2018072*_programid.$" "kafka://localhost/ztf_json"
+# kcp --progress --from-avro --to-json avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
+# kcp --progress --from-avro --to-avro avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
+# kcp --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json "kafka://localhost/ztf_avro"
+# kcp --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json foo.avro
+# kcp --progress --from-json --to-json file1.json file2.json file2.json foo.json  # should output a JSON record-set, one record per line
 #
 
 def map_tree(obj, fun):
