@@ -1,0 +1,410 @@
+#! /usr/bin/env python
+
+import sys, io, time, argparse, string, signal, itertools, os.path
+import json, base64
+import fastavro, fastavro.write
+from confluent_kafka import Consumer, Producer, KafkaError
+from contextlib import contextmanager
+from collections import namedtuple
+
+#
+# Goals:
+#
+# st --progress --from-avro --to-json "kafka://epyc.astro.washington.edu:9092/^ztf_2018072*_programid.$" "kafka://localhost/ztf_json"
+# st --progress --from-avro --to-json avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
+# st --progress --from-avro --to-avro avro_file1.avro avro_file2.avro avro_file3.avro "kafka://localhost/ztf_json"
+# st --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json "kafka://localhost/ztf_avro"
+# st --progress --from-json --to-avro --schema=myavro.json file1.json file2.json file2.json foo.avro
+# st --progress --from-json --to-json file1.json file2.json file2.json foo.json  # should output a JSON record-set, one record per line
+#
+
+def map_tree(obj, fun):
+	if isinstance(obj, dict):
+		return { k: map_tree(v, fun) for k, v in obj.items() }
+
+	if isinstance(obj, list):
+		return [ map_tree(v, fun) for v in obj ]
+
+	return fun(obj)
+
+def encode_bytes(obj):
+	if isinstance(obj, bytes):
+		# encode bytes to data: URI
+		uri  = "data:application/octet-stream;base64,"
+		uri += base64.b64encode(obj).decode('ascii')
+		return uri
+
+	return obj
+
+def decode_bytes(obj):
+	data_bytes_magic = "data:application/octet-stream;base64,"
+
+	if isinstance(obj, str) and obj.startswith(data_bytes_magic):
+		# encode bytes to data: URI
+		data = base64.b64decode(obj[len(data_bytes_magic):].encode('ascii'))
+		return data
+
+	return obj
+
+@contextmanager
+def KafkaDataSource(groupid, brokers, topics):
+	commit = True
+	if groupid is None:
+		# if groupid hasn't been given, emulate a low-level consumer:
+		#   - generate a random groupid
+		#   - disable committing (so we never commit the random groupid)
+		#   - start reading from the earliest (smallest) offset
+		import getpass, random
+		groupid = getpass.getuser() + '-' + ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(20))
+		commit = False
+		print(f"Generated fake groupid {groupid} and commit={commit}")
+
+	c = None
+	try:
+		c = Consumer({
+			'bootstrap.servers': brokers,
+			'group.id': groupid,
+			'default.topic.config': {
+				'auto.offset.reset': 'smallest'
+			},
+			'enable.auto.commit': False
+		})
+		c.subscribe(topics)
+
+		def read():
+			t = time.time()
+			while True:
+				msg = c.poll(1.0)
+				if msg is None:
+					continue
+				elif msg.error():
+					if msg.error().code() == KafkaError._PARTITION_EOF:
+						continue
+					else:
+						raise Exception(msg.error())
+				else:
+					yield msg
+
+				# Occasionally commit read offsets (note: while this ensures we won't lose any
+				# messages, some may be duplicated if the program is killed before offsets are committed).
+				now = time.time()
+				if commit and now - t > 5:
+					print("COMMITTING")
+#					c.commit()
+					t = now
+		yield read()
+	finally:
+		if c is not None:
+			# Make sure the offsets are committed, and consumer is closed (some
+			# versions of confluent_kafka segfault if c.close() isn't called explicitly).
+			if commit:
+				print("COMMITTING")
+#				c.commit()
+			c.close()
+
+MessageMetadata = namedtuple('MessageMetadata', ['schema', 'source'])
+
+@contextmanager
+def DataSource(sources, from_fmt):
+	# Source options:
+	#	- json file(s)
+	#	- kafka stream
+	#	- avro file(s)
+	#
+	# Format options:
+	#	- json
+	#	- avro
+
+	# Read a record given a seekable bytes stream
+	def json_record_reader(fp):
+		try:
+			# JSON format?
+			yield json.load(fp), None
+			return
+		except json.JSONDecodeError:
+			pass
+
+		# JSONL format
+		fp.seek(0)
+		for line in fp:
+			yield json.loads(line), None
+
+	def avro_record_reader(fp):
+		rr = fastavro.reader(fp)
+		for record in rr:
+			yield (record, rr.schema)
+
+	readers = {
+		'json': json_record_reader,
+		'avro': avro_record_reader
+	};
+	if from_fmt is not None:
+		record_reader = readers[from_fmt]
+	else:
+		# autoselect format
+		def record_reader(fp):
+			# yield from first reader that doesn't raise an exception
+			for fmt, rr in readers.items():
+				try:
+					yield from rr(fp)
+				except:
+					fp.seek(0)
+
+	# Construct the source as a seekable bytes stream
+	def file_read(fn, record_reader):
+		with open(fn, 'rb') as fp:
+			for record, schema in record_reader(fp):
+				yield record, MessageMetadata(schema=schema, source=fn)
+
+	def kafka_read(sourcespec, record_reader):
+		groupid, brokers, topics = sourcespec
+		with KafkaDataSource(groupid, brokers, topics) as raw_read:
+			for msg in raw_read:
+				with io.BytesIO(msg.value()) as fp:
+					for record, schema in record_reader(fp):
+						yield record, MessageMetadata(schema=schema, source=kafka_url_str(groupid, brokers, [msg.topic()]))
+
+	def multi_reader(sources):
+		for sourcetype, sourcespec in sources:
+			yield from {
+				'file': file_read,
+				'kafka': kafka_read
+			}[sourcetype](sourcespec, record_reader)
+
+	try:
+		source = multi_reader(sources)
+		yield source
+	finally:
+		# close the generator to trigger any cleanup
+		source.close()
+
+class JsonKafkaWriter:
+	p = None
+
+	def __init__(self, destspec, schema):
+		_, self.brokers, self.topic = destspec
+
+		assert len(self.topic) == 1
+		self.topic = self.topic[0]
+
+		self.schema = schema
+
+		self.p = Producer({
+			'bootstrap.servers': self.brokers
+		})
+
+	def write(self, record):
+		self.p.poll(0)
+		js = json.dumps(map_tree(record, encode_bytes))
+		self.p.produce(self.topic, js.encode('utf-8'))
+
+	def close(self):
+		if self.p is not None:
+			self.p.flush()
+
+class AvroKafkaWriter(JsonKafkaWriter):
+	def write(self, record):
+		self.p.poll(0)
+		with io.BytesIO() as fp:
+			fastavro.writer(fp, self.schema, map_tree(record, decode_bytes))
+			self.p.produce(self.topic, fp.getvalue())
+
+class JsonFileWriter():
+	fp = None
+
+	def __init__(self, fn, schema):
+		self.fp = open(fn, 'wb')
+
+	def write(self, record):
+		js = json.dumps(map_tree(record, encode_bytes))
+		self.fp.write(js.encode('utf-8'))
+		self.fp.write('\n'.encode('utf-8'))
+
+	def close(self):
+		if self.fp is not None:
+			self.fp.close()
+
+class AvroFileWriter():
+	fp = None
+	out = None
+
+	def __init__(self, fn, schema):
+		self.schema = schema
+		self.fp = open(fn, 'wb')
+		self.out = fastavro.write.Writer(self.fp, schema, codec='deflate')
+
+	def write(self, record):
+		self.out.write(map_tree(record, decode_bytes))
+
+	def close(self):
+		if self.out is not None:
+			self.out.flush()
+
+		if self.fp is not None:
+			self.fp.close()
+
+
+@contextmanager
+def DataWriter(dest, to_fmt, schema):
+	(desttype, *destspec) = dest
+
+	Writer = {
+		'json+file':  JsonFileWriter,
+		'avro+file':  AvroFileWriter,
+		'json+kafka': JsonKafkaWriter,
+		'avro+kafka': AvroKafkaWriter
+	}['%s+%s' % (to_fmt, desttype)]
+
+	try:
+		w = Writer(*destspec, schema)
+		yield w
+	finally:
+		w.close()
+
+@contextmanager
+def ProgressMeter(visible=False):
+	if not visible:
+		yield lambda *foo: None
+		return
+
+	chars = string.digits + string.ascii_uppercase + string.ascii_lowercase + '*'
+	nread = 0
+	active_sources = {}
+
+	def progress(nread_, source):
+		# update our copy of nread
+		nread = nread_
+
+		# Friendly progress report
+		# Print a different character for different sources (topics, files, ...)
+		try:
+			char = active_sources[source]
+		except KeyError:
+			nextchar = len(active_sources) if len(active_sources) < len(chars) else -1
+			char = active_sources[source] = chars[nextchar]
+		print(char, end='', flush=True)
+		
+		if nread % 80 == 0:
+			print(" [ % 7d @ %s ]" % (nread, time.strftime("%b %d %Y %H:%M:%S")), flush=True)
+
+	try:
+		yield progress
+	finally:
+		if nread % 80 != 0:
+			print(" [ % 7d @ %s ]" % (nread, time.strftime("%b %d %Y %H:%M:%S")), flush=True)
+		if active_sources:
+			print("\nSources read:")
+			for source in active_sources:
+				print("  %s" % source)
+
+def parse_kafka_url(val):
+	assert val.startswith("kafka://")
+
+	val = val[len("kafka://"):]
+
+	try:
+		(groupid_brokers, topics) = val.split('/')
+	except ValueError:
+		raise argparse.ArgumentError(self, f'A kafka:// url must be of the form kafka://[groupid@]broker[,broker2[,...]]/topicspec[,topicspec[,...]].')
+
+	try:
+		(groupid, brokers) = groupid_brokers.split('@')
+	except ValueError:
+		(groupid, brokers) = (None, groupid_brokers)
+
+	topics = topics.split(',')
+	
+	return (groupid, brokers, topics)
+
+def kafka_url_str(groupid, brokers, topics):
+	return "kafka://%s%s/%s" % (groupid + '@' if groupid is not None else '', brokers, ','.join(topics))
+
+class ParseUriAction(argparse.Action):
+	def parse_uris(self, args):
+		for k, val in enumerate(args):
+			if val.startswith("kafka://"):
+				if k + 1 != len(args):
+					raise argparse.ArgumentError(self, 'Only a single kafka:// source is allowed, and it must be the last source given.')
+
+				yield ("kafka", parse_kafka_url(val))
+			else:
+				yield ("file", val)
+
+	def __call__(self, parser, namespace, values, option_string=None):
+		if isinstance(values, str):
+			values = [ values ]
+		setattr(namespace, self.dest, [ val for val in self.parse_uris(values) ])
+
+if __name__ == "__main__":
+	formats = { 'json', 'avro' }
+
+	parser = argparse.ArgumentParser(
+		description='Consume AVRO or JSON-formatted messages from a source, and produce them to a destination.'
+		)
+
+	parser.add_argument('sources', type=str, nargs='+', action=ParseUriAction, help='Data source.')
+	parser.add_argument('dest',   type=str, action=ParseUriAction, help='Data destination')
+
+	parser.add_argument('--from', dest='from_fmt', choices=formats, type=str, help='Input format')
+	parser.add_argument('--to',   dest='to_fmt', choices=formats, type=str, help='Input format')
+
+	parser.add_argument('--schema',   type=str, help='Output schema')
+	parser.add_argument('--save-schema',   type=str, help='Save input schema into a file')
+	parser.add_argument('--count',   type=int, help='Number of messages to consume')
+
+	parser.add_argument('--progress', action='store_true', help='Show progress indicator')
+
+	args = parser.parse_args()
+
+	if args.to_fmt is None:
+		# try to autodetect from destination
+		desttype, fn = args.dest[0]
+		if desttype != "file":
+			parser.error("Can only auto-detect output format for regular files.")
+
+		_, ext = os.path.splitext(fn)
+		if ext != '' and ext[1:] not in formats:
+			parser.error("Failed to autodetect the output format from file extension.")
+
+		args.to_fmt = ext[1:]
+
+	try:
+		schema = None
+		if args.schema is not None:
+			with open(args.schema, "rb") as fp:
+				schema = json.load(fp)
+
+		with DataSource(args.sources, args.from_fmt) as source:
+			# Peek for the schema from the first message
+			if schema is None:
+				val = next(source, None)
+				if val:
+					_, meta = val
+					schema = meta.schema
+					source = itertools.chain([val], source)
+				else:
+					# empty source
+					source = []
+
+			with DataWriter(args.dest[0], args.to_fmt, schema) as dest, \
+			     ProgressMeter(args.progress) as progress:
+				for nread, (msg, meta) in enumerate(source, start=1):
+					if args.save_schema:
+						# Write out the schema
+						with open(args.save_schema, 'wb') as fp:
+							fp.write(json.dumps(meta.schema, indent=2).encode('utf-8'))
+						args.save_schema = None
+
+					if nread-1 == args.count:
+						break
+
+					# Block receiving CTRL-C, so the output file isn't corrupted
+					signal.pthread_sigmask(signal.SIG_BLOCK,[signal.SIGINT])
+					dest.write(msg)
+					signal.pthread_sigmask(signal.SIG_UNBLOCK,[signal.SIGINT])
+
+					# Update the progress bar
+					progress(nread, meta.source)
+	except (KeyboardInterrupt):
+		# suppress ugly error messages
+		pass
