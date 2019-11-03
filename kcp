@@ -301,8 +301,13 @@ def ProgressMeter(visible=False):
 		if nread % 80 != 0:
 			print(" [ % 7d @ %s ]" % (nread, time.strftime("%b %d %Y %H:%M:%S")), flush=True)
 		if active_sources:
-			print("\nSources read:")
-			for source in active_sources:
+			as_ = list(active_sources.keys())
+			NMAX = 10
+			if len(as_) > NMAX:
+				# trim if too long...
+				as_ = as_[:NMAX//2] + [ "..." ] + as_[-NMAX//2:]
+			print("\n %d sources read:" % len(active_sources))
+			for source in as_:
 				print("  %s" % source)
 
 def parse_kafka_url(val):
@@ -336,7 +341,12 @@ class ParseUriAction(argparse.Action):
 
 				yield ("kafka", parse_kafka_url(val))
 			else:
-				yield ("file", val)
+				if '*' in val:
+					import glob
+					for v in glob.iglob(val):
+						yield ("file", v)
+				else:
+					yield ("file", val)
 
 	def __call__(self, parser, namespace, values, option_string=None):
 		if isinstance(values, str):
