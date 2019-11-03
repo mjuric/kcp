@@ -75,7 +75,8 @@ def KafkaDataSource(groupid, brokers, topics):
 			'default.topic.config': {
 				'auto.offset.reset': 'smallest'
 			},
-			'enable.auto.commit': False
+			'enable.auto.commit': False,
+			'queued.min.messages': 1000,
 		})
 		c.subscribe(topics)
 
